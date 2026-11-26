@@ -1,0 +1,490 @@
+// Tsumugi — Prisma schema
+//
+// 方針:
+// - 工数・勤務時間は「業務日（JST の日付）」＋「その日の 0:00 からの分」で持つ。浮動小数点数は使わない。
+// - 金額は円の整数。労務費は 分 × 時間単価 ÷ 60 を切り捨て（整数演算）。
+// - email はアプリ層で小文字化して保存・検索する。
+// - 同じ人・同じ日の工数の重なりは btree_gist の排他制約で禁止する（migration の SQL）。
+// - 承認履歴と監査ログは追記のみ（UPDATE / DELETE をトリガーで拒否）。
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+// 接続先は prisma.config.ts の datasource.url（DATABASE_URL）で指定する（Prisma 7）。
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum Role {
+  ADMIN
+  MANAGER
+  MEMBER
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum ProjectKind {
+  /// 業務プロジェクト（直接工数）。顧客・売上額は任意。
+  WORK
+  /// 社内業務（間接工数）。全員が入力できる。
+  INTERNAL
+}
+
+enum ProjectStatus {
+  PROSPECT
+  ACTIVE
+  COMPLETED
+  CANCELED
+}
+
+enum ExpenseKind {
+  OUTSOURCING
+  EXPENSE
+}
+
+enum TimesheetStatus {
+  SUBMITTED
+  APPROVED
+  REJECTED
+  WITHDRAWN
+}
+
+enum ApprovalEventType {
+  SUBMIT
+  WITHDRAW
+  APPROVE
+  REJECT
+  CANCEL_APPROVAL
+}
+
+enum AuditAction {
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  PASSWORD_CHANGE
+  PASSWORD_RESET
+  TOTP_ENABLE
+  TOTP_DISABLE
+  TOTP_RESET
+  USER_CREATE
+  USER_UPDATE
+  USER_DISABLE
+  RATE_CHANGE
+  TIMESHEET_SUBMIT
+  TIMESHEET_WITHDRAW
+  TIMESHEET_APPROVE
+  TIMESHEET_REJECT
+  TIMESHEET_APPROVAL_CANCEL
+  MONTH_CLOSE
+  MONTH_REOPEN
+  PROJECT_CHANGE
+  EXPENSE_CHANGE
+  MASTER_CHANGE
+  COMPANY_CHANGE
+  EXPORT
+}
+
+enum AiFeature {
+  DRAFT_ENTRIES
+  EXPLAIN_FORECAST
+  SUMMARIZE_PERIOD
+  MONTHLY_REPORT
+}
+
+enum AiOutcome {
+  OK
+  FALLBACK_NO_KEY
+  RATE_LIMITED
+  TIMEOUT
+  API_ERROR
+  REFUSAL
+  INVALID_OUTPUT
+}
+
+// ============================================================
+// 会社・ユーザー
+// ============================================================
+
+/// 会社設定（1 行だけ。id = 1）
+model Company {
+  id                  Int      @id @default(1)
+  name                String
+  /// タイムラインの刻み（5 / 10 / 15 / 30 分）
+  timeStepMinutes     Int      @default(15)
+  /// 勤務時間と工数合計の差の閾値（分）
+  gapThresholdMinutes Int      @default(15)
+  /// 提出期限の猶予（期間の終了日から何日）
+  submissionGraceDays Int      @default(3)
+  /// 管理者・マネージャーに 2 段階認証を必須にするか
+  requireTotpForManagers Boolean @default(true)
+  updatedAt           DateTime @updatedAt @db.Timestamptz(6)
+}
+
+model Department {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  name      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  users User[]
+}
+
+/// 会社独自の休日（国民の祝日は計算で求める）
+model Holiday {
+  date DateTime @id @db.Date
+  name String
+}
+
+model User {
+  id                   String     @id @default(uuid()) @db.Uuid
+  email                String     @unique
+  name                 String
+  passwordHash         String
+  role                 Role       @default(MEMBER)
+  status               UserStatus @default(ACTIVE)
+  departmentId         String?    @db.Uuid
+  approverId           String?    @db.Uuid
+  /// マネージャーに単価・原価・粗利の閲覧を許すか（ADMIN は常に可）
+  canViewCost          Boolean    @default(false)
+  /// 所定労働時間（分/日）
+  dailyStandardMinutes Int        @default(480)
+  mustChangePassword   Boolean    @default(false)
+  /// 2 段階認証（TOTP）のシークレット（AES-256-GCM で暗号化）
+  totpSecretEnc        String?
+  totpEnabledAt        DateTime?  @db.Timestamptz(6)
+  /// 同じコードの再利用を防ぐため、最後に使った時間ステップ
+  totpLastUsedStep     Int?
+  /// パスワード変更・権限変更・無効化で増やし、既存のセッションを無効にする
+  sessionVersion       Int        @default(0)
+  createdAt            DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime   @updatedAt @db.Timestamptz(6)
+
+  department    Department?      @relation(fields: [departmentId], references: [id])
+  approver      User?            @relation("Approver", fields: [approverId], references: [id])
+  subordinates  User[]           @relation("Approver")
+  costRates     CostRate[]
+  recoveryCodes RecoveryCode[]
+  managedProjects Project[]      @relation("ProjectPm")
+  memberships   ProjectMember[]
+  timeEntries   TimeEntry[]
+  attendances   Attendance[]
+  timer         RunningTimer?
+  periods       TimesheetPeriod[] @relation("PeriodOwner")
+  decidedPeriods TimesheetPeriod[] @relation("PeriodDecider")
+  approvalEvents ApprovalEvent[]
+  auditLogs     AuditLog[]        @relation("AuditActor")
+  expenses      Expense[]
+  aiUsageLogs   AiUsageLog[]
+
+  @@index([approverId])
+  @@index([departmentId])
+}
+
+model RecoveryCode {
+  id       String    @id @default(uuid()) @db.Uuid
+  userId   String    @db.Uuid
+  codeHash String
+  usedAt   DateTime? @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// 時間単価の履歴（適用開始日付き）
+model CostRate {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @db.Uuid
+  effectiveFrom DateTime @db.Date
+  /// 円/時（0〜100,000）
+  hourlyRate    Int
+  createdAt     DateTime @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, effectiveFrom])
+}
+
+// ============================================================
+// プロジェクト
+// ============================================================
+
+model Client {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  name      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  projects Project[]
+}
+
+model WorkCategory {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  name      String
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+
+  timeEntries TimeEntry[]
+  timers      RunningTimer[]
+}
+
+model Project {
+  id            String        @id @default(uuid()) @db.Uuid
+  code          String        @unique
+  name          String
+  kind          ProjectKind   @default(WORK)
+  status        ProjectStatus @default(ACTIVE)
+  clientId      String?       @db.Uuid
+  pmId          String?       @db.Uuid
+  startDate     DateTime      @db.Date
+  endDate       DateTime?     @db.Date
+  /// 売上額（税抜・円）。任意。
+  revenueAmount Int?
+  /// タイムラインの色（0〜11 のパレット番号）
+  colorIndex    Int           @default(0)
+  note          String        @default("")
+  createdAt     DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime      @updatedAt @db.Timestamptz(6)
+
+  client      Client?         @relation(fields: [clientId], references: [id])
+  pm          User?           @relation("ProjectPm", fields: [pmId], references: [id])
+  phases      Phase[]
+  members     ProjectMember[]
+  timeEntries TimeEntry[]
+  expenses    Expense[]
+  laborCosts  MonthlyLaborCost[]
+  timers      RunningTimer[]
+
+  @@index([pmId])
+  @@index([status])
+}
+
+model ProjectMember {
+  projectId String @db.Uuid
+  userId    String @db.Uuid
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@id([projectId, userId])
+  @@index([userId])
+}
+
+/// 工程（フェーズ）。予算工数と、PM が更新する残り見込み。
+model Phase {
+  id               String  @id @default(uuid()) @db.Uuid
+  projectId        String  @db.Uuid
+  name             String
+  sortOrder        Int     @default(0)
+  budgetMinutes    Int     @default(0)
+  /// 残り見込み（分）。null は未入力（予算 − 実績 で仮置き）。
+  remainingMinutes Int?
+  active           Boolean @default(true)
+
+  project     Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  timeEntries TimeEntry[]
+  timers      RunningTimer[]
+
+  @@unique([projectId, name])
+  @@unique([id, projectId])
+}
+
+model Expense {
+  id          String      @id @default(uuid()) @db.Uuid
+  projectId   String      @db.Uuid
+  date        DateTime    @db.Date
+  kind        ExpenseKind
+  amount      Int
+  description String
+  createdById String      @db.Uuid
+  createdAt   DateTime    @default(now()) @db.Timestamptz(6)
+
+  project   Project @relation(fields: [projectId], references: [id])
+  createdBy User    @relation(fields: [createdById], references: [id])
+
+  @@index([projectId, date])
+}
+
+// ============================================================
+// 工数（中核）
+// ============================================================
+
+model TimeEntry {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @db.Uuid
+  projectId      String   @db.Uuid
+  phaseId        String   @db.Uuid
+  workCategoryId String?  @db.Uuid
+  /// 業務日（JST）
+  date           DateTime @db.Date
+  startMinute    Int
+  endMinute      Int
+  minutes        Int
+  note           String   @default("")
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
+
+  user         User          @relation(fields: [userId], references: [id])
+  project      Project       @relation(fields: [projectId], references: [id])
+  phase        Phase         @relation(fields: [phaseId, projectId], references: [id, projectId])
+  workCategory WorkCategory? @relation(fields: [workCategoryId], references: [id])
+
+  @@index([userId, date])
+  @@index([projectId, date])
+  @@index([phaseId])
+}
+
+/// 日ごとの勤務時間（始業・終業・休憩）と、差の理由
+model Attendance {
+  userId       String   @db.Uuid
+  date         DateTime @db.Date
+  startMinute  Int
+  /// 翌日にまたがる場合は 1440 以上
+  endMinute    Int
+  breakMinutes Int      @default(0)
+  gapReason    String   @default("")
+  updatedAt    DateTime @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@id([userId, date])
+}
+
+model RunningTimer {
+  userId         String   @id @db.Uuid
+  projectId      String   @db.Uuid
+  phaseId        String   @db.Uuid
+  workCategoryId String?  @db.Uuid
+  note           String   @default("")
+  startedAt      DateTime @db.Timestamptz(6)
+
+  user         User          @relation(fields: [userId], references: [id])
+  project      Project       @relation(fields: [projectId], references: [id])
+  phase        Phase         @relation(fields: [phaseId], references: [id])
+  workCategory WorkCategory? @relation(fields: [workCategoryId], references: [id])
+}
+
+// ============================================================
+// 提出・承認・締め
+// ============================================================
+
+model TimesheetPeriod {
+  id           String          @id @default(uuid()) @db.Uuid
+  userId       String          @db.Uuid
+  startDate    DateTime        @db.Date
+  endDate      DateTime        @db.Date
+  status       TimesheetStatus
+  totalMinutes Int             @default(0)
+  submittedAt  DateTime?       @db.Timestamptz(6)
+  decidedAt    DateTime?       @db.Timestamptz(6)
+  deciderId    String?         @db.Uuid
+  comment      String          @default("")
+  updatedAt    DateTime        @updatedAt @db.Timestamptz(6)
+
+  user    User            @relation("PeriodOwner", fields: [userId], references: [id])
+  decider User?           @relation("PeriodDecider", fields: [deciderId], references: [id])
+  events  ApprovalEvent[]
+
+  @@unique([userId, startDate])
+  @@index([status])
+}
+
+/// 承認履歴（追記のみ）
+model ApprovalEvent {
+  id       String            @id @default(uuid()) @db.Uuid
+  periodId String            @db.Uuid
+  type     ApprovalEventType
+  actorId  String            @db.Uuid
+  comment  String            @default("")
+  at       DateTime          @default(now()) @db.Timestamptz(6)
+
+  period TimesheetPeriod @relation(fields: [periodId], references: [id])
+  actor  User            @relation(fields: [actorId], references: [id])
+
+  @@index([periodId, at])
+}
+
+/// 締めた月（行がない月は未締め）
+model ClosingMonth {
+  yearMonth    String    @id
+  closed       Boolean   @default(true)
+  closedAt     DateTime? @db.Timestamptz(6)
+  closedById   String?   @db.Uuid
+  reopenedAt   DateTime? @db.Timestamptz(6)
+  reopenReason String    @default("")
+}
+
+/// 締めた時点の労務費（メンバー × プロジェクト × 月）
+model MonthlyLaborCost {
+  yearMonth      String
+  userId         String  @db.Uuid
+  projectId      String  @db.Uuid
+  minutes        Int
+  laborCost      Int
+  unratedMinutes Int     @default(0)
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@id([yearMonth, userId, projectId])
+}
+
+// ============================================================
+// 監査・AI
+// ============================================================
+
+/// 監査ログ（追記のみ）
+model AuditLog {
+  id         String      @id @default(uuid()) @db.Uuid
+  at         DateTime    @default(now()) @db.Timestamptz(6)
+  actorId    String?     @db.Uuid
+  action     AuditAction
+  targetType String
+  targetId   String?
+  ip         String?
+  detail     Json?
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([at])
+  @@index([actorId, at])
+  @@index([action, at])
+}
+
+model AiUsageLog {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String?   @db.Uuid
+  feature      AiFeature
+  model        String?
+  outcome      AiOutcome
+  inputTokens  Int?
+  outputTokens Int?
+  latencyMs    Int?
+  createdAt    DateTime  @default(now()) @db.Timestamptz(6)
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+}
+
+/// Tsumugi の応答キャッシュ（検証済みの出力のみ）
+model AiCache {
+  key       String    @id
+  feature   AiFeature
+  output    Json
+  expiresAt DateTime  @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@index([expiresAt])
+}

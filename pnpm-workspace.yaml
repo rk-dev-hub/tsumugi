@@ -1,0 +1,13 @@
+onlyBuiltDependencies:
+  - "@prisma/client"
+  - "@prisma/engines"
+  - "@node-rs/argon2"
+  - esbuild
+  - lefthook
+  - prisma
+ignoredBuiltDependencies:
+  - sharp
+  - unrs-resolver
+overrides:
+  # GHSA-7589-6fvf-x4pw（Prisma CLI が使う effect の ReDoS）
+  effect: "3.22.4"

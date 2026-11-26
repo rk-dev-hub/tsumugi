@@ -1,0 +1,59 @@
+# docker compose up      … DB とアプリを起動（http://localhost:3300）。初回は体験用データが入る
+# docker compose up -d db … DB だけ起動（pnpm dev で開発するとき）
+# DB のパスワードはローカルで試すためのダミー値です。AUTH_SECRET は未設定なら初回に自動で作ります。
+name: tsumugi
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tsumugi
+      POSTGRES_PASSWORD: tsumugi
+      POSTGRES_DB: tsumugi
+      TZ: Asia/Tokyo
+    ports:
+      - "127.0.0.1:${DB_PORT:-5435}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tsumugi -d tsumugi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    image: tsumugi:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://tsumugi:tsumugi@db:5432/tsumugi?schema=public
+      # 未設定なら初回にランダムな値を作り、app-secrets ボリュームに保存する（scripts/docker-entrypoint.sh）
+      AUTH_SECRET: ${AUTH_SECRET:-}
+      AUTH_URL: http://localhost:${APP_PORT:-3300}
+      APP_URL: http://localhost:${APP_PORT:-3300}
+      CSV_ENCODING: ${CSV_ENCODING:-utf8-bom}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      TSUMUGI_AI_MODEL: ${TSUMUGI_AI_MODEL:-claude-haiku-5-5}
+      TSUMUGI_AI_DAILY_LIMIT: ${TSUMUGI_AI_DAILY_LIMIT:-60}
+    ports:
+      - "127.0.0.1:${APP_PORT:-3300}:3300"
+    volumes:
+      - app-secrets:/app/.secrets
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3300/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+
+volumes:
+  db-data:
+  app-secrets:
